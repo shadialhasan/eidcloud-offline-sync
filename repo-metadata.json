@@ -1,0 +1,12 @@
+{
+  "description": "Offline-first distributed synchronization engine for SQLite using CRDTs and Hybrid Logical Clocks in pure PHP",
+  "topics": [
+    "eidcloud",
+    "offline-first",
+    "crdt",
+    "database-sync",
+    "sqlite",
+    "distributed-systems",
+    "php8"
+  ]
+}

@@ -1,0 +1,205 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+// Pure PHP autoloader
+spl_autoload_register(function (string $class) {
+    $prefix = 'EidCloud\\OfflineSync\\';
+    $baseDir = __DIR__ . '/../src/';
+
+    $len = strlen($prefix);
+    if (strncmp($prefix, $class, $len) !== 0) {
+        return;
+    }
+
+    $relativeClass = substr($class, $len);
+    $file = $baseDir . str_replace('\\', '/', $relativeClass) . '.php';
+
+    if (file_exists($file)) {
+        require $file;
+    }
+});
+
+use EidCloud\OfflineSync\SyncEngine;
+use EidCloud\OfflineSync\Storage\SqliteStore;
+
+function printUsage(): void
+{
+    echo <<<'HELP_TEXT'
+🔄 eidcloud-sync CLI - Distributed Offline-First Sync Engine (v1.0.0)
+
+USAGE:
+  php bin/eidcloud-sync <command> [options]
+
+COMMANDS:
+  node-init           Initialize a SQLite database for CRDT offline synchronization.
+  sync                Synchronize local SQLite database with a peer node or dump delta payload.
+  conflicts-report    View audit log of resolved LWW conflicts.
+  stats               Display local CRDT mutation queue and metadata statistics.
+  help, -h, --help    Show this help documentation.
+
+OPTIONS:
+  --db=<path>         Path to target SQLite database file (default: local.sqlite)
+  --node-id=<id>      Custom unique Node ID (default: auto-generated from hostname/hash)
+  --peer=<url_or_db>  Remote peer endpoint URL or local SQLite peer database path
+  --table=<table>     Target specific table for synchronization
+  --since=<hlc>       Delta sync filter for mutations occurring after HLC timestamp
+  --json              Output responses formatted as wire-ready JSON
+
+EXAMPLES:
+  # Initialize SQLite database with CRDT tracking metadata
+  php bin/eidcloud-sync node-init --db=local.sqlite --node-id=node-alpha
+
+  # Synchronize with peer SQLite database file
+  php bin/eidcloud-sync sync --db=local.sqlite --peer=peer.sqlite
+
+  # Export wire-ready delta JSON payload
+  php bin/eidcloud-sync sync --db=local.sqlite --json
+
+  # Inspect conflict audit report
+  php bin/eidcloud-sync conflicts-report --db=local.sqlite
+
+HELP_TEXT;
+}
+
+$args = array_slice($argv, 1);
+if (empty($args) || in_array('--help', $args, true) || in_array('-h', $args, true) || in_array('help', $args, true)) {
+    printUsage();
+    exit(0);
+}
+
+$command = $args[0];
+$options = [];
+
+foreach (array_slice($args, 1) as $arg) {
+    if (str_starts_with($arg, '--')) {
+        $parts = explode('=', substr($arg, 2), 2);
+        $options[$parts[0]] = $parts[1] ?? true;
+    }
+}
+
+$dbPath = $options['db'] ?? 'local.sqlite';
+$nodeId = $options['node-id'] ?? null;
+$table = $options['table'] ?? null;
+$peer = $options['peer'] ?? null;
+$since = $options['since'] ?? null;
+$asJson = isset($options['json']);
+
+try {
+    switch ($command) {
+        case 'node-init':
+            $engine = SyncEngine::open($dbPath, $nodeId);
+            if ($asJson) {
+                echo json_encode([
+                    'status' => 'success',
+                    'node_id' => $engine->getNodeId(),
+                    'db' => realpath($dbPath) ?: $dbPath,
+                    'message' => 'CRDT synchronization metadata initialized successfully.'
+                ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL;
+            } else {
+                echo "✅ Initialized node [{$engine->getNodeId()}] on database: {$dbPath}" . PHP_EOL;
+                echo "   CRDT tables, indexes, and mutation queue are ready." . PHP_EOL;
+            }
+            break;
+
+        case 'sync':
+            $engine = SyncEngine::open($dbPath, $nodeId);
+
+            if ($peer !== null) {
+                if (file_exists($peer)) {
+                    // Local file-based peer sync
+                    $peerEngine = SyncEngine::open($peer);
+                    $result = $engine->syncWithPeer($peerEngine);
+
+                    if ($asJson) {
+                        echo json_encode(['status' => 'success', 'results' => $result], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL;
+                    } else {
+                        echo "🔄 Bidirectional sync completed with peer [{$peerEngine->getNodeId()}]:" . PHP_EOL;
+                        echo "   Local  -> Applied: {$result['local_applied']['applied']}, Conflicts: {$result['local_applied']['conflicts']}, Ignored: {$result['local_applied']['ignored']}" . PHP_EOL;
+                        echo "   Remote -> Applied: {$result['peer_applied']['applied']}, Conflicts: {$result['peer_applied']['conflicts']}, Ignored: {$result['peer_applied']['ignored']}" . PHP_EOL;
+                    }
+                } else {
+                    // Remote HTTP peer sync
+                    echo "🌐 Connecting to remote peer endpoint: {$peer}" . PHP_EOL;
+                    $payload = $engine->exportDeltaPayload($since, $table);
+                    $jsonPayload = json_encode($payload);
+
+                    $ch = curl_init($peer . '/sync');
+                    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                    curl_setopt($ch, CURLOPT_POST, true);
+                    curl_setopt($ch, CURLOPT_POSTFIELDS, $jsonPayload);
+                    curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+                    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+                    $response = curl_exec($ch);
+                    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                    curl_close($ch);
+
+                    if ($response === false || $httpCode >= 400) {
+                        throw new RuntimeException("Peer request to {$peer} failed (HTTP {$httpCode}). Enqueued in local mutation queue.");
+                    }
+
+                    $respData = json_decode($response, true);
+                    if ($respData) {
+                        $engine->applyDeltaPayload($respData);
+                    }
+                    echo "✅ Network sync completed with {$peer}." . PHP_EOL;
+                }
+            } else {
+                // Export delta payload to stdout
+                $payload = $engine->exportDeltaPayload($since, $table);
+                echo json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL;
+            }
+            break;
+
+        case 'conflicts-report':
+            $engine = SyncEngine::open($dbPath, $nodeId);
+            $conflicts = $engine->getStore()->getConflicts(50);
+
+            if ($asJson) {
+                echo json_encode(['status' => 'success', 'count' => count($conflicts), 'conflicts' => $conflicts], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL;
+            } else {
+                echo "📋 Conflict Resolution Report (LWW with HLC):" . PHP_EOL;
+                if (empty($conflicts)) {
+                    echo "   No conflicts recorded. All updates were linearly causal." . PHP_EOL;
+                } else {
+                    foreach ($conflicts as $idx => $c) {
+                        echo sprintf(
+                            "   #%d [%s.%s id=%s] Resolved At: %s\n      Winner HLC: %s (Value: %s)\n      Loser  HLC: %s (Value: %s)\n",
+                            $idx + 1,
+                            $c['table_name'],
+                            $c['column_name'],
+                            $c['record_id'],
+                            $c['resolved_at'],
+                            $c['winner_hlc'],
+                            $c['winner_val'] ?? '<null>',
+                            $c['loser_hlc'],
+                            $c['loser_val'] ?? '<null>'
+                        );
+                    }
+                }
+            }
+            break;
+
+        case 'stats':
+            $engine = SyncEngine::open($dbPath, $nodeId);
+            $queueStats = $engine->getQueue()->getStats();
+            $changes = $engine->getStore()->getChangesSince();
+
+            echo "📊 Synchronization Statistics [Node: {$engine->getNodeId()}]:" . PHP_EOL;
+            echo "   Total CRDT Replicated Fields: " . count($changes) . PHP_EOL;
+            echo "   Pending Queue:   " . $queueStats['pending'] . PHP_EOL;
+            echo "   Retry Queue:     " . $queueStats['retry'] . PHP_EOL;
+            echo "   Completed Queue: " . $queueStats['completed'] . PHP_EOL;
+            echo "   Failed Queue:    " . $queueStats['failed'] . PHP_EOL;
+            break;
+
+        default:
+            echo "❌ Unknown command: {$command}" . PHP_EOL;
+            printUsage();
+            exit(1);
+    }
+} catch (Throwable $e) {
+    fwrite(STDERR, "❌ Error: " . $e->getMessage() . PHP_EOL);
+    exit(1);
+}

@@ -1,0 +1,32 @@
+{
+  "name": "eidcloud/offline-sync",
+  "description": "Offline-first distributed synchronization engine for SQLite using CRDTs and Hybrid Logical Clocks in pure PHP",
+  "type": "library",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "Eng. MHD. Shadi AL-Hasan",
+      "role": "Author & Maintainer"
+    }
+  ],
+  "require": {
+    "php": ">=8.2",
+    "ext-pdo": "*",
+    "ext-pdo_sqlite": "*",
+    "ext-json": "*"
+  },
+  "autoload": {
+    "psr-4": {
+      "EidCloud\\OfflineSync\\": "src/"
+    }
+  },
+  "bin": [
+    "bin/eidcloud-sync"
+  ],
+  "scripts": {
+    "test": "php tests/run_tests.php"
+  },
+  "config": {
+    "sort-packages": true
+  }
+}

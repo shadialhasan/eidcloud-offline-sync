@@ -1,0 +1,9 @@
+/vendor/
+composer.lock
+*.sqlite
+*.sqlite3
+*.db
+*.log
+.phpunit.result.cache
+.DS_Store
+Thumbs.db
